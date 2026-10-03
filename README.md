@@ -1,4 +1,4 @@
-# Fabric Now pattern worker
+# Pattern worker
 
 This is the image/pattern-processing worker used by the main Style/FabricNow
 company workspace.
