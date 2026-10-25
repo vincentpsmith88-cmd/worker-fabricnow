@@ -359,3 +359,82 @@ def delete_job(request: Request, jid: str):
             if _meta(jid).get("user_id") != user_id: raise HTTPException(404, "Project not found")
             shutil.rmtree(JOBS / jid, ignore_errors=True)
         except HTTPException: raise
+
+# ---------------------------------------------------------------------------
+# FabricNow calibrated body reconstruction + measurement-driven pattern drafting
+# ---------------------------------------------------------------------------
+from fastapi.responses import Response
+import body_engine
+
+BODY_MAX_UPLOAD_MB = int(os.getenv("BODY_MAX_UPLOAD_MB", "12"))
+BODY_SCANS = Path(os.getenv("DATA_DIR", "./data")) / "body-scans"
+BODY_SCANS.mkdir(parents=True, exist_ok=True)
+
+
+def _body_internal_auth(request: Request):
+    # Unlike public image-generation endpoints, these endpoints are backend-to-backend only.
+    if not INTERNAL_SECRET:
+        raise HTTPException(503, "FABRIC_NOW_INTERNAL_SECRET is not configured on the worker.")
+    if request.headers.get("x-fabric-internal-secret") != INTERNAL_SECRET:
+        raise HTTPException(401, "Worker authentication required.")
+
+
+@app.post("/body-measurements/process")
+async def process_body_measurements(request: Request,
+    front: UploadFile = File(...), side: UploadFile = File(...),
+    back: UploadFile | None = File(None), left: UploadFile | None = File(None), right: UploadFile | None = File(None),
+    height: float = Form(...), unit: str = Form("cm"), scan_id: str = Form(...)):
+    _body_internal_auth(request)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", scan_id):
+        raise HTTPException(400, "Invalid scan identifier.")
+    if unit not in ("cm", "in"):
+        raise HTTPException(400, "Unit must be cm or in.")
+    dest = BODY_SCANS / scan_id
+    dest.mkdir(parents=True, exist_ok=True)
+    uploads = {"front":front,"side":side,"back":back,"left":left,"right":right}
+    raw = {}
+    for name, file in uploads.items():
+        if not file: continue
+        data = await file.read(BODY_MAX_UPLOAD_MB * 1024 * 1024 + 1)
+        if len(data) > BODY_MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(413, f"{name} photo exceeds {BODY_MAX_UPLOAD_MB} MB.")
+        if not data: raise HTTPException(400, f"{name} photo is empty.")
+        raw[name] = data
+    if "front" not in raw or "side" not in raw:
+        raise HTTPException(400, "Front and side photos are required.")
+    try:
+        result = body_engine.reconstruct(raw["front"], raw["side"], height, unit, dest, {k:v for k,v in raw.items() if k not in ("front","side")})
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        log.exception("Body reconstruction failed")
+        raise HTTPException(500, "Body reconstruction failed. Check photo quality and worker logs.")
+    result["outputs"] = {k:f"/body-measurements/files/{scan_id}/{v}" for k,v in result["outputs"].items()}
+    return result
+
+
+@app.post("/body-measurements/patterns")
+async def create_body_pattern(request: Request):
+    _body_internal_auth(request)
+    try: data = await request.json()
+    except Exception: raise HTTPException(400, "Expected a JSON pattern request.")
+    scan_id = str(data.get("scan_id") or uuid.uuid4())
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", scan_id): raise HTTPException(400,"Invalid scan identifier.")
+    out = BODY_SCANS / scan_id / "patterns" / str(uuid.uuid4())
+    try: result = body_engine.draft_pattern(data, out)
+    except ValueError as e: raise HTTPException(422, str(e))
+    result["outputs"] = {k:f"/body-measurements/files/{scan_id}/patterns/{out.name}/{v}" for k,v in result["outputs"].items()}
+    return result
+
+
+@app.get("/body-measurements/files/{scan_id}/{filename}")
+@app.get("/body-measurements/files/{scan_id}/patterns/{pattern_id}/{filename}")
+def get_body_file(request: Request, scan_id: str, filename: str, pattern_id: str | None = None):
+    _body_internal_auth(request)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", scan_id): raise HTTPException(404)
+    if filename not in {"body.glb","front-silhouette.png","side-silhouette.png","pattern.svg","pattern.json"}: raise HTTPException(404)
+    base = (BODY_SCANS / scan_id).resolve()
+    target = (base / "patterns" / pattern_id / filename if pattern_id else base / filename).resolve()
+    if not target.is_relative_to(base) or not target.is_file(): raise HTTPException(404)
+    media = "model/gltf-binary" if filename.endswith(".glb") else "image/png" if filename.endswith(".png") else "image/svg+xml" if filename.endswith(".svg") else "application/json"
+    return FileResponse(target, media_type=media, filename=filename)
