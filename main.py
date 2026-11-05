@@ -136,21 +136,28 @@ def _run(jid):
         try:
             provider = AI_VISION_PROVIDER.lower()
             vision_client = get_client() if provider == "openai" or (provider == "auto" and not os.getenv("ANTHROPIC_API_KEY")) else None
-            plan = pipeline.analyze(vision_client, VISION_MODEL, src, m["garment"], m["lining"])
+            plan = pipeline.analyze(vision_client, VISION_MODEL, src, m["garment"], m["lining"],
+                                    notes=m.get("notes", ""), variants=m.get("variants"))
         except (openai.AuthenticationError, openai.RateLimitError):
             raise
         except Exception:
-            log.exception("garment analysis failed; continuing with a generic prompt")
+            log.exception("garment analysis failed")
+        if not plan:
+            raise ValueError("The garment could not be analysed. Try a clearer, full-length photo.")
         swatch = (d / "swatch.png").read_bytes() if (d / "swatch.png").exists() else (
             pipeline.crop_swatch(src, plan.get("swatch")) if plan else None)
-        _save(jid, step=1, stage="AI is determining garment type and mathematical pattern geometry", plan={"garment": plan["garment"], "region_family": plan.get("region_family"), "style_family": plan.get("style_family"), "scale_basis": plan.get("scale_basis"), "geometry_confidence": plan.get("geometry_confidence"), "pieces": plan["pieces"]})
+        _save(jid, step=1, stage="AI is determining garment type and mathematical pattern geometry", plan={"garment": plan["garment"], "region_family": plan.get("region_family"), "style_family": plan.get("style_family"), "scale_basis": plan.get("scale_basis"), "geometry_confidence": plan.get("geometry_confidence"), "pieces": plan["pieces"], "variants_requested": plan.get("variants_requested")})
         _save(jid, step=2, stage="Rendering exact numeric geometry and fabric pieces")
         pieces = pipeline.export_all(None, d / "export", src, plan=plan, swatch_bytes=swatch)
         qa = {"enabled": False, "mode": "deterministic-geometry", "ok": True}
         _save(jid, qa=qa, output_format="fabricnow-basic-pattern-v3-mathematical-geometry")
         if not pieces:
             raise ValueError("No separate pieces were detected. Try a clearer, full-length photo.")
-        _save(jid, status="done", step=3, stage="Ready", pieces=pieces)
+        report = pipeline.variant_report(plan) if plan.get("variants_requested") else None
+        warnings = []
+        if report and report["extra_cuts"] and report["missing"]:
+            warnings.append("The AI did not return extra cuts for: " + ", ".join(report["missing"]) + ". Try again, or add them in Tailor Tools.")
+        _save(jid, status="done", step=3, stage="Ready", pieces=pieces, variants_result=report, warnings=warnings)
     except openai.RateLimitError:
         _save(jid, status="failed", error="The image service is busy or out of quota. Try again shortly.")
     except openai.AuthenticationError:
@@ -264,7 +271,8 @@ def _prep(raw: bytes) -> Image.Image:
 
 @app.post("/api/jobs", status_code=202)
 async def create_job(request: Request, file: UploadFile = File(...), swatch: UploadFile | None = File(None),
-                     garment: str = Form("Auto-detect"), notes: str = Form(""), lining: str = Form("none")):
+                     garment: str = Form("Auto-detect"), notes: str = Form(""), lining: str = Form("none"),
+                     variants: str = Form("")):
     _internal_auth(request)
     user_id = _user_id(request)
     _rate(request)
@@ -284,7 +292,8 @@ async def create_job(request: Request, file: UploadFile = File(...), swatch: Upl
     if simg: simg.save(d / "swatch.png", "PNG")
     (d / "job.json").write_text(json.dumps(dict(
         id=jid, user_id=user_id, status="queued", step=0, stage="Reading the garment and fabric", created=int(time.time()),
-        garment="Auto-detect", notes=notes[:500], lining=str(lining).lower()[:20], pieces=[], plan=None, error=None)))
+        garment="Auto-detect", notes=notes[:2000], lining=str(lining).lower()[:20],
+        variants=pipeline.parse_variants(variants[:4000]), pieces=[], plan=None, error=None)))
     pool.submit(_run, jid)
     return _meta(jid)
 

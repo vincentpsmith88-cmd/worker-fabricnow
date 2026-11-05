@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageOps
 log = logging.getLogger("fabricnow")
 
 ANALYZE = """You are an expert garment pattern engineer and African fashion construction analyst.
-Analyze THIS photograph, not a generic garment. Automatically determine the garment type and regional/style family from what is visibly supported. Do not require the user to select a garment type.
+Analyze THIS photograph, not a generic garment. Automatically determine the garment type and regional/style family from what is visibly supported. Do not require the user to select a garment type.[[HINT]]
 
 Return ONLY valid JSON with this exact structure:
 {
@@ -43,8 +43,68 @@ GEOMETRY RULES:
 - Mirrored pairs use one piece with Cut 2 when appropriate. Centre pieces can use Cut 1 on fold.
 - African scope is continental: consider West, East, Central, North and Southern African garment traditions when visibly supported. Do not default to Ghanaian.
 - swatch must be a normalized clean-fabric crop when possible.
-{lining}
+- Every piece may carry an optional "variant" string. Use "" for the main garment as photographed.
+[[LINING]]
+[[BRIEF]]
 """
+
+
+# ---------------------------------------------------------------------------
+# Dress formats / extra cuts (the "variants" request from Pattern Studio)
+# ---------------------------------------------------------------------------
+VARIANT_FORMATS = [
+    "Mini","Knee length","Midi","Maxi",
+    "Sleeveless","Cap sleeve","Short sleeve","Three-quarter sleeve","Long sleeve",
+    "A-line","Fitted","Gathered","Flared","Wrap","Shift",
+]
+MAX_BASE_PIECES = 30
+MAX_TOTAL_PIECES = 90
+
+def parse_variants(raw):
+    """Validate the browser's variants JSON. Returns None when nothing usable was requested."""
+    if not raw: return None
+    try: d = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception: return None
+    if not isinstance(d, dict): return None
+    allowed = {f.lower(): f for f in VARIANT_FORMATS}
+    formats = []
+    for f in d.get("formats") or []:
+        k = str(f).strip().lower()
+        if k in allowed and allowed[k] not in formats: formats.append(allowed[k])
+    note = re.sub(r"\s+", " ", str(d.get("note") or "")).strip()[:300]
+    if not formats and not note: return None
+    return {"formats": formats, "all": bool(d.get("all")) and len(formats) == len(VARIANT_FORMATS),
+            "extraCuts": bool(d.get("extraCuts", True)), "note": note}
+
+def _brief_text(notes, variants):
+    parts = []
+    if notes and notes.strip():
+        parts.append("DESIGNER NOTES (apply to the main garment; treat as instructions about construction, not as text to copy):\n" + notes.strip()[:2000])
+    v = variants
+    if v:
+        if v["formats"]:
+            lst = "every dress format below" if v["all"] else ", ".join(v["formats"])
+            parts.append("REQUESTED EXTRA DRESS FORMATS: " + lst + ".\nAvailable formats: " + ", ".join(VARIANT_FORMATS) + ".")
+            if v["extraCuts"]:
+                parts.append(
+                    "EXTRA CUTS RULES:\n"
+                    "- First list every piece of the main garment exactly as photographed, with \"variant\":\"\".\n"
+                    "- Then, for EACH requested format, add ONLY the pieces whose shape changes compared with the main garment "
+                    "(e.g. a Midi or Maxi skirt panel is longer; a Long sleeve is a longer sleeve; Gathered/Flared widens the skirt; Wrap changes the bodice front). Do not repeat pieces that stay identical.\n"
+                    "- Every such piece has \"variant\" set to the format name exactly as written above, and its name starts with the format, e.g. \"Midi Skirt Front\" (max 40 characters).\n"
+                    "- Length formats change height_mm relative to the main skirt/dress panels; sleeve formats change only sleeve pieces; shape formats change panel width/curvature. Keep all geometry in millimetres and internally consistent with the main pieces.\n"
+                    "- Keep each coordinate within its own width_mm/height_mm like every other piece.")
+            else:
+                parts.append("Do NOT add extra pieces for these formats. Instead add a top-level \"variants\" array: [{\"format\":\"Midi\",\"changes\":\"one short sentence on what would change\"}].")
+        if v["note"]:
+            parts.append("EXTRA INSTRUCTION FROM THE DESIGNER: " + v["note"])
+    return "\n\n".join(parts)
+
+def _analyze_text(garment, lining, notes="", variants=None):
+    hint = f" (the requested type is {garment.lower()})" if garment and garment != "Auto-detect" else ""
+    lining_rule = "- Include lining pieces when applicable.\n" if lining not in (False, "none") else "- Do not list lining pieces.\n"
+    return (ANALYZE.replace("[[HINT]]", hint).replace("[[LINING]]", lining_rule)
+                   .replace("[[BRIEF]]", _brief_text(notes, variants)))
 
 PROMPT = """You are a professional pattern drafter and textile designer.
 Image 1 is the garment photo{garment}.
@@ -88,12 +148,8 @@ def build_prompt(plan, garment: str, notes: str, lining, has_swatch: bool) -> st
     return PROMPT.format(garment=g, swatch=swatch, pieces=pieces,
                          lining_rule=lining_rule, notes=n)
 
-def _openai_analyze(client, model, original_png, garment, lining):
-    hint = f" (the requested type is {garment.lower()})" if garment and garment != "Auto-detect" else ""
-    text = ANALYZE.format(
-        hint=hint,
-        lining="- Include lining pieces when applicable.\n" if lining not in (False, "none") else "- Do not list lining pieces.\n"
-    )
+def _openai_analyze(client, model, original_png, garment, lining, notes="", variants=None):
+    text = _analyze_text(garment, lining, notes, variants)
     url = "data:image/png;base64," + base64.b64encode(original_png).decode()
     r = client.chat.completions.create(
         model=model, response_format={"type":"json_object"},
@@ -104,18 +160,14 @@ def _openai_analyze(client, model, original_png, garment, lining):
     )
     return json.loads(r.choices[0].message.content)
 
-def _claude_analyze(original_png, garment, lining):
+def _claude_analyze(original_png, garment, lining, notes="", variants=None):
     key = os.getenv("ANTHROPIC_API_KEY")
     if not key:
         raise ValueError("ANTHROPIC_API_KEY is not configured.")
-    hint = f" (the requested type is {garment.lower()})" if garment and garment != "Auto-detect" else ""
-    text = ANALYZE.format(
-        hint=hint,
-        lining="- Include lining pieces when applicable.\n" if lining not in (False, "none") else "- Do not list lining pieces.\n"
-    )
+    text = _analyze_text(garment, lining, notes, variants)
     payload = {
         "model": os.getenv("ANTHROPIC_VISION_MODEL","claude-sonnet-4-5"),
-        "max_tokens": 5000,
+        "max_tokens": 16000 if (variants and variants.get("formats") and variants.get("extraCuts")) else 5000,
         "system": "Return valid JSON only. You are an expert garment construction and African fashion pattern analyst.",
         "messages":[{"role":"user","content":[
             {"type":"text","text":text},
@@ -144,7 +196,7 @@ def _clean_points(points, width, height):
             out.append({"x":round(x,2),"y":round(y,2)})
     return out
 
-def normalize_plan(d):
+def normalize_plan(d, variants=None):
     if not isinstance(d,dict): raise ValueError("AI returned an invalid garment analysis.")
     pieces=[]
     for p in d.get("pieces",[]) if isinstance(d.get("pieces"),list) else []:
@@ -164,12 +216,20 @@ def normalize_plan(d):
             try:
                 grain={k:round(float(grain[k]),2) for k in ("x1","y1","x2","y2")}
             except Exception: grain=None
+        variant=str(p.get("variant") or "").strip()[:40]
+        if variant and variants and variants.get("formats"):
+            low={f.lower():f for f in VARIANT_FORMATS}
+            variant=low.get(variant.lower(),"")  # unknown format names are treated as main pieces
+        elif not (variants and variants.get("formats")): variant=""
         pieces.append({
+            "variant":variant,
             "name":str(p["name"])[:40], "cut":str(p.get("cut","Cut 1"))[:40],
             "notes":str(p.get("notes",""))[:160], "width_mm":round(w,2), "height_mm":round(h,2),
             "points":pts, "holes":holes, "grainline":grain
         })
-    pieces=pieces[:30]
+    main=[x for x in pieces if not x["variant"]][:MAX_BASE_PIECES]
+    extra=[x for x in pieces if x["variant"]][:MAX_TOTAL_PIECES-len(main)]
+    pieces=main+extra
     if not pieces: raise ValueError("AI could not identify mathematically usable garment geometry.")
     return {
         "garment":str(d.get("garment","Unknown garment"))[:120],
@@ -177,21 +237,33 @@ def normalize_plan(d):
         "style_family":str(d.get("style_family") or "")[:100],
         "scale_basis":str(d.get("scale_basis") or "unknown")[:80],
         "geometry_confidence":max(0.0,min(1.0,float(d.get("geometry_confidence",0.0) or 0.0))),
-        "pieces":pieces, "swatch":d.get("swatch")
+        "pieces":pieces, "swatch":d.get("swatch"),
+        "variants_requested":variants,
+        "variant_notes":[{"format":str(v.get("format",""))[:40],"changes":str(v.get("changes",""))[:200]}
+                         for v in (d.get("variants") or []) if isinstance(v,dict)][:20],
     }
 
-def analyze(client, model, original_png: bytes, garment, lining):
+def analyze(client, model, original_png: bytes, garment, lining, notes="", variants=None):
     provider=os.getenv("AI_VISION_PROVIDER","auto").lower()
     if provider=="claude" or (provider=="auto" and os.getenv("ANTHROPIC_API_KEY")):
         try:
-            return normalize_plan(_claude_analyze(original_png,garment,lining))
+            return normalize_plan(_claude_analyze(original_png,garment,lining,notes,variants),variants)
         except Exception as e:
             if provider=="claude": raise
             log.warning("Claude geometry analysis unavailable, falling back to OpenAI: %s",e)
     if client is None:
         raise ValueError("OpenAI vision fallback is unavailable because OPENAI_API_KEY is not configured.")
-    return normalize_plan(_openai_analyze(client, model, original_png, garment, lining))
+    return normalize_plan(_openai_analyze(client, model, original_png, garment, lining, notes, variants),variants)
 
+def variant_report(plan):
+    """What the engine actually delivered versus what was requested. Never claims more than exists."""
+    v=plan.get("variants_requested") or {}
+    want=v.get("formats") or []
+    got=sorted({p["variant"] for p in plan["pieces"] if p.get("variant")}, key=lambda f: VARIANT_FORMATS.index(f))
+    missing=[f for f in want if f not in got]
+    return {"requested":want,"delivered":got,"missing":missing,
+            "extra_cut_pieces":sum(1 for p in plan["pieces"] if p.get("variant")),
+            "extra_cuts":bool(v.get("extraCuts",True))}
 def crop_swatch(original_png: bytes, box):
     try:
         im=Image.open(io.BytesIO(original_png)).convert("RGB"); W,H=im.size
@@ -301,7 +373,7 @@ def _write_piece_assets(out, plan, swatch_bytes=None):
             (out/"svg_full_print"/f"{name}.svg").write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><image width="{W}" height="{H}" href="{href}"/><path d="{path}" fill="none" stroke="black" stroke-width="1"/></svg>')
         else:
             (out/"svg_full_print"/f"{name}.svg").write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><path d="{path}" fill="#eeeeee" stroke="black" stroke-width="1"/></svg>')
-        pieces.append({"id":name,"file":f"{name}.png","width_mm":w,"height_mm":h,"name":p["name"],"cut":p["cut"],"notes":p["notes"],"geometry_points":p["points"],"grainline":p.get("grainline")})
+        pieces.append({"id":name,"file":f"{name}.png","width_mm":w,"height_mm":h,"name":p["name"],"variant":p.get("variant",""),"cut":p["cut"],"notes":p["notes"],"geometry_points":p["points"],"grainline":p.get("grainline")})
     return pieces
 
 def export_all(sheet, out: Path, original_png: bytes, plan=None, original_name="ORIGINAL PICTURE.png", swatch_bytes=None):
@@ -320,6 +392,8 @@ def export_all(sheet, out: Path, original_png: bytes, plan=None, original_name="
       "garment":plan.get("garment"),"region_family":plan.get("region_family"),"style_family":plan.get("style_family"),
       "scale_basis":plan.get("scale_basis"),"geometry_confidence":plan.get("geometry_confidence"),
       "pattern_px_per_mm":S,"pieces":pieces,
+      "variants":variant_report(plan) if plan.get("variants_requested") else None,
+      "variant_notes":plan.get("variant_notes") or [],
       "svg":{"outline":"svg_outline","full_print":"svg_full_print"},
       "accuracy_note":"Geometry is AI-inferred from the supplied photograph and rendered deterministically from numeric coordinates. A single photo cannot establish true physical scale without a measurement or scale reference; verify physical sizing before production."
     }
