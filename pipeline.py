@@ -1,7 +1,7 @@
 """Fabric Now AI pattern pipeline.
 
-Photo -> vision analysis -> AI technical pattern sheet -> validation -> piece extraction -> ZIP.
-OpenAI is used for image generation. Vision analysis can use OpenAI or Anthropic Claude.
+Photo -> vision analysis -> numeric pattern geometry -> deterministic SVG/PNG rendering -> ZIP.
+Vision analysis can use OpenAI or Anthropic Claude. Image-generation models are not used to draw production pattern boundaries.
 """
 import base64, io, json, logging, os, re, urllib.request, urllib.error
 from pathlib import Path
@@ -30,19 +30,19 @@ Return ONLY valid JSON with this exact structure:
 }
 
 GEOMETRY RULES:
-- Identify EVERY visible/necessary fabric piece for THIS garment: bodices, panels, sleeves, collars, cuffs, pockets, waistbands, belts, ties, facings, yokes, peplums, skirt/trouser panels and other construction pieces.
-- The geometry is NOT an illustration. It is a 2D cutting-pattern approximation expressed in millimetres.
-- Each piece has a local origin at its top-left. points must be ordered clockwise around the outer cut boundary.
-- Use enough points to describe curves accurately (typically 16-60 points for curved pieces). Do not use a crude rectangle for a curved garment piece.
-- Keep every coordinate between 0 and width_mm/height_mm.
-- width_mm and height_mm must tightly bound the points.
-- holes contains closed point lists only when the photo supports an actual cut-out/hole.
-- grainline is optional; use it when the garment construction supports a clear grain direction.
-- Estimate geometry from visible proportions and recognized garment construction. If physical scale cannot be established from the image, say so with scale_basis=unknown and keep geometry internally consistent. Never claim production-grade physical sizing from a single photo.
-- Do not invent hidden pieces unless required by the visible construction.
-- Mirrored pairs use one piece with Cut 2 when appropriate. Centre pieces can use Cut 1 on fold.
-- African scope is continental: consider West, East, Central, North and Southern African garment traditions when visibly supported. Do not default to Ghanaian.
-- swatch must be a normalized clean-fabric crop when possible.
+- Identify all separate fabric components required to construct the photographed garment, including mirrored pairs, facings, waistbands, cuffs, ruffles, collars and sleeve pieces where visible/necessary.
+- Treat this as a pattern-drafting task, never an illustration task. Return 2D cutting-piece outlines as numeric coordinates in millimetres.
+- Draft each piece as its own complete closed contour, with a local origin at its top-left and points ordered clockwise.
+- Curves are essential: use 24-80 points for armholes, necklines, sleeve caps, crotch curves, curved hems and shaped panels. Never simplify a curved piece to a rectangle, capsule or generic blob.
+- Reproduce garment-specific proportions: shoulder slope, armhole depth, waist shaping, dart intake, sleeve cap, flare, gathers and hem shape.
+- Coordinates must remain within width_mm and height_mm; those dimensions must tightly bound the contour.
+- Avoid self-intersections, duplicate points, zero-area shapes and disconnected contours. Each piece must be a single manufacturable 2D cut shape.
+- Use holes only for real cut-outs. Include grainline when construction supports it.
+- Identify the full set of pieces. Use Cut 2 for mirrored pairs when one unique shape is used twice; use Cut 1 on fold for centre pieces cut on fold.
+- Infer scale only when supported. A single uncalibrated photograph cannot establish true millimetres: use scale_basis=unknown and keep proportions coherent. Never claim production-grade physical sizing from one photo.
+- Do not invent hidden decorative pieces, but do include construction pieces required to make the visible garment.
+- Consider African garment traditions across West, East, Central, North and Southern Africa only where the image supports them; do not assume one country or style.
+- swatch must be a clean, normalized crop of the actual fabric when possible.
 - Every piece may carry an optional "variant" string. Use "" for the main garment as photographed.
 [[LINING]]
 [[BRIEF]]
@@ -109,26 +109,24 @@ def _analyze_text(garment, lining, notes="", variants=None):
 PROMPT = """You are a professional pattern drafter and textile designer.
 Image 1 is the garment photo{garment}.
 {swatch}
-Create ONE flat 2D technical pattern sheet containing exactly these sewing pieces, one isolated shape per line:
+Create a clean 2D technical pattern sheet with exactly the supplied sewing pieces, each shown as a separate, complete cut shape:
 {pieces}
 
-Construction:
-- Match the photographed garment silhouette, proportions, panel divisions, pleats/gathers, sleeves, neckline, collars, belts and closures.
-- Use realistic flat pattern-piece silhouettes, not a fashion illustration.
-- Keep each piece completely separated from every other piece.
-- Pieces are upright and straight-on; do not rotate them.
-- Use a tidy grid with a 4% clear margin.
-- No mannequin, person, body, hands, shadows or seam markings.
+Drafting quality:
+- Follow the garment's actual silhouette, construction, panel divisions, pleats/gathers, sleeve shape, neckline, collar, cuffs, waistband, ruffles and closures.
+- Every piece must be a complete, recognizable flat pattern shape with smooth accurate curves, not a rectangle, rough crop or fashion illustration.
+- Keep every piece fully visible, separated, upright and straight-on. No overlap, clipping, rotation or perspective.
+- Arrange in a balanced grid with consistent spacing and generous margins.
+- Use a plain white background. No checkerboard, mannequin, person, hands, shadows, decorative props or fake transparency.
 
 Fabric:
-- Preserve the actual garment's visible print, colours and motif character.
-- If Image 2 exists, Image 2 is the exact fabric reference. Reproduce its motif family, colours and approximate scale consistently across every piece.
-- Never use solid black as a substitute for fabric.
+- Preserve the actual garment print, colour palette and motif character.
+- If Image 2 exists, use it as the exact fabric reference. Keep the same motif scale and repeat density across all pattern pieces; do not independently stretch the print to fit each shape.
+- Never substitute solid black or unrelated fabric.
 
 Labels:
-- Under each piece write ONLY its exact label from the supplied list.
-- Labels must be readable and must not touch the pattern shape.
-- Do not add title blocks, rulers, dimensions or extra pieces.
+- Place the exact supplied label under each piece, readable and separate from the shape.
+- Do not add title blocks, rulers, dimensions, extra pieces or decorative text.
 
 {lining_rule}
 {notes}"""
@@ -319,61 +317,121 @@ def _svg_path(points, ox=0, oy=0, scale=1.0):
     if not points: return ""
     return "M " + " ".join(f"{(p['x']+ox)*scale:.3f},{(p['y']+oy)*scale:.3f}" for p in points) + " Z"
 
-def _render_geometry(plan, swatch_bytes=None):
-    """Deterministically render Claude's measured geometry. No image model invents the final boundaries."""
-    S=float(os.getenv("PATTERN_PX_PER_MM","2"))
-    margin_mm=30; gap_mm=35; label_mm=18
-    cols=[]; x=margin_mm; y=margin_mm; row_h=0; max_w=0
+def _texture_plane(texture, size, repeat_px=260):
+    """Build one consistent fabric-repeat plane so every piece shares the same motif scale."""
+    if texture is None:
+        return None
+    tw = th = max(96, int(repeat_px))
+    tile = ImageOps.fit(texture.convert("RGB"), (tw, th), method=Image.Resampling.LANCZOS)
+    # Mirror alternate tiles to reduce obvious seams when the supplied swatch is not tileable.
+    mirror_x = ImageOps.mirror(tile)
+    mirror_y = ImageOps.flip(tile)
+    mirror_xy = ImageOps.flip(mirror_x)
+    variants = ((tile, mirror_x), (mirror_y, mirror_xy))
+    plane = Image.new("RGB", size, (255, 255, 255))
+    for row, y in enumerate(range(0, size[1], th)):
+        for col, x in enumerate(range(0, size[0], tw)):
+            plane.paste(variants[row % 2][col % 2], (x, y))
+    return plane
+
+def _pattern_layout(plan):
+    S = float(os.getenv("PATTERN_PX_PER_MM", "3"))
+    margin_mm, gap_mm, label_mm = 30, 35, 24
+    max_width_mm = float(os.getenv("PATTERN_SHEET_WIDTH_MM", "900"))
+    widest_piece = max((p["width_mm"] for p in plan["pieces"]), default=0)
+    max_width_mm = max(max_width_mm, widest_piece + margin_mm * 2)
+    x = y = margin_mm
+    row_h = 0
+    max_right = margin_mm
     for p in plan["pieces"]:
-        w=p["width_mm"]+gap_mm; h=p["height_mm"]+label_mm+gap_mm
-        if x>margin_mm and x+w>900: x=margin_mm; y+=row_h; row_h=0
-        p["sheet_x_mm"]=x; p["sheet_y_mm"]=y; x+=w; row_h=max(row_h,h); max_w=max(max_w,x)
-    sheet_w=max(1000,max_w+margin_mm); sheet_h=max(800,y+row_h+margin_mm)
-    img=Image.new("RGBA",(int(sheet_w*S),int(sheet_h*S)),(255,255,255,255))
-    texture=None
+        w, h = p["width_mm"], p["height_mm"]
+        if x > margin_mm and x + w > max_width_mm - margin_mm:
+            x = margin_mm
+            y += row_h
+            row_h = 0
+        p["sheet_x_mm"], p["sheet_y_mm"] = x, y
+        x += w + gap_mm
+        row_h = max(row_h, h + label_mm + gap_mm)
+        max_right = max(max_right, x)
+    sheet_w_mm = max(300, min(max_width_mm, max_right + margin_mm))
+    sheet_h_mm = max(300, y + row_h + margin_mm)
+    return S, (int(sheet_w_mm * S), int(sheet_h_mm * S))
+
+def _render_geometry(plan, swatch_bytes=None):
+    """Render model-proposed numeric geometry deterministically; AI never paints the cut boundaries."""
+    S, sheet_size = _pattern_layout(plan)
+    # Transparent master sheet; the human-facing technical sheet is composited onto white below.
+    img = Image.new("RGBA", sheet_size, (255, 255, 255, 0))
+    texture = None
     if swatch_bytes:
-        try: texture=Image.open(io.BytesIO(swatch_bytes)).convert("RGB")
-        except Exception: texture=None
-    for idx,p in enumerate(plan["pieces"],1):
-        ox,oy=p["sheet_x_mm"],p["sheet_y_mm"]
-        poly=[(int((q["x"]+ox)*S),int((q["y"]+oy)*S)) for q in p["points"]]
-        mask=Image.new("L",img.size,0); ImageDraw.Draw(mask).polygon(poly,fill=255)
-        if texture:
-            tw=max(1,int(p["width_mm"]*S)); th=max(1,int(p["height_mm"]*S)); tile=ImageOps.fit(texture,(tw,th),method=Image.Resampling.LANCZOS)
-            layer=Image.new("RGBA",img.size,(255,255,255,0)); layer.paste(tile,(int(ox*S),int(oy*S)),None); img=Image.composite(layer,img,mask)
+        try:
+            texture = Image.open(io.BytesIO(swatch_bytes)).convert("RGB")
+        except Exception:
+            texture = None
+    repeat_px = int(os.getenv("FABRIC_REPEAT_PX", "260"))
+    fabric_plane = _texture_plane(texture, sheet_size, repeat_px) if texture else None
+    for idx, p in enumerate(plan["pieces"], 1):
+        ox, oy = p["sheet_x_mm"], p["sheet_y_mm"]
+        x0, y0 = int(ox * S), int(oy * S)
+        W, H = max(1, int(p["width_mm"] * S)), max(1, int(p["height_mm"] * S))
+        poly = [(int((q["x"] + ox) * S), int((q["y"] + oy) * S)) for q in p["points"]]
+        mask = Image.new("L", sheet_size, 0)
+        ImageDraw.Draw(mask).polygon(poly, fill=255)
+        if fabric_plane:
+            layer = Image.new("RGBA", sheet_size, (255, 255, 255, 0))
+            layer.paste(fabric_plane.crop((x0, y0, x0 + W, y0 + H)).convert("RGBA"), (x0, y0))
+            img = Image.composite(layer, img, mask)
         else:
-            ImageDraw.Draw(img).polygon(poly,fill=(238,238,238,255))
-        dr=ImageDraw.Draw(img); dr.line(poly+[poly[0]],fill=(20,20,20,255),width=max(2,int(S)))
+            ImageDraw.Draw(img).polygon(poly, fill=(238, 238, 238, 255))
+        dr = ImageDraw.Draw(img)
+        dr.line(poly + [poly[0]], fill=(24, 24, 24, 255), width=max(2, int(S)))
         if p.get("grainline"):
-            g=p["grainline"]; dr.line([(int((g["x1"]+ox)*S),int((g["y1"]+oy)*S)),(int((g["x2"]+ox)*S),int((g["y2"]+oy)*S))],fill=(40,40,40,255),width=max(1,int(S*.7)))
-        dr.text((int(ox*S),int((oy+p["height_mm"]+7)*S)),f"{idx:02d} {p['name']}",fill=(0,0,0,255))
+            g = p["grainline"]
+            dr.line([(int((g["x1"] + ox) * S), int((g["y1"] + oy) * S)),
+                     (int((g["x2"] + ox) * S), int((g["y2"] + oy) * S))],
+                    fill=(40, 40, 40, 255), width=max(1, int(S * .7)))
+        dr.text((x0, int((oy + p["height_mm"] + 7) * S)), f"{idx:02d}  {p['name']}", fill=(20, 20, 20, 255))
     return img, S
 
 def _write_piece_assets(out, plan, swatch_bytes=None):
-    S=float(os.getenv("PATTERN_PX_PER_MM","2")); (out/"svg_outline").mkdir(parents=True,exist_ok=True); (out/"svg_full_print").mkdir(parents=True,exist_ok=True)
-    texture=None
+    S = float(os.getenv("PATTERN_PX_PER_MM", "3"))
+    (out / "svg_outline").mkdir(parents=True, exist_ok=True)
+    (out / "svg_full_print").mkdir(parents=True, exist_ok=True)
+    texture = None
     if swatch_bytes:
-        try: texture=Image.open(io.BytesIO(swatch_bytes)).convert("RGB")
-        except Exception: texture=None
-    pieces=[]
-    for k,p in enumerate(plan["pieces"],1):
-        w,h=p["width_mm"],p["height_mm"]; W=max(1,int(w*S)); H=max(1,int(h*S));
-        mask=Image.new("L",(W,H),0); ImageDraw.Draw(mask).polygon([(int(q["x"]*S),int(q["y"]*S)) for q in p["points"]],fill=255)
-        if texture: tile=ImageOps.fit(texture,(W,H),method=Image.Resampling.LANCZOS)
-        else: tile=Image.new("RGB",(W,H),(238,238,238))
-        crop=tile.convert("RGBA"); crop.putalpha(mask)
-        name=f"piece_{k:02d}"; crop.save(out/f"{name}.png")
-        path=_svg_path(p["points"],scale=S)
-        hdr=f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><path d="{path}" fill="none" fill-rule="evenodd" stroke="black" stroke-width="2"/>'
+        try:
+            texture = Image.open(io.BytesIO(swatch_bytes)).convert("RGB")
+        except Exception:
+            texture = None
+    repeat_px = int(os.getenv("FABRIC_REPEAT_PX", "260"))
+    pieces = []
+    for k, p in enumerate(plan["pieces"], 1):
+        w, h = p["width_mm"], p["height_mm"]
+        W, H = max(1, int(w * S)), max(1, int(h * S))
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).polygon([(int(q["x"] * S), int(q["y"] * S)) for q in p["points"]], fill=255)
+        # Same fixed repeat size and origin for every asset: motifs no longer balloon or shrink per piece.
+        fabric_plane = _texture_plane(texture, (W, H), repeat_px) if texture else None
+        tile = fabric_plane if fabric_plane else Image.new("RGB", (W, H), (238, 238, 238))
+        crop = tile.convert("RGBA")
+        crop.putalpha(mask)
+        name = f"piece_{k:02d}"
+        crop.save(out / f"{name}.png", optimize=True)
+        path = _svg_path(p["points"], scale=S)
+        hdr = f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><path d="{path}" fill="none" fill-rule="evenodd" stroke="black" stroke-width="2"/>'
         if p.get("grainline"):
-            g=p["grainline"]; hdr+=f'<line x1="{g["x1"]*S:.3f}" y1="{g["y1"]*S:.3f}" x2="{g["x2"]*S:.3f}" y2="{g["y2"]*S:.3f}" stroke="black" stroke-width="1" stroke-dasharray="8 6"/>'
-        (out/"svg_outline"/f"{name}_outline.svg").write_text(hdr+"</svg>")
+            g = p["grainline"]
+            hdr += f'<line x1="{g["x1"]*S:.3f}" y1="{g["y1"]*S:.3f}" x2="{g["x2"]*S:.3f}" y2="{g["y2"]*S:.3f}" stroke="black" stroke-width="1" stroke-dasharray="8 6"/>'
+        (out / "svg_outline" / f"{name}_outline.svg").write_text(hdr + "</svg>")
         if texture:
-            b=io.BytesIO(); crop.save(b,"PNG"); href="data:image/png;base64,"+base64.b64encode(b.getvalue()).decode()
-            (out/"svg_full_print"/f"{name}.svg").write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><image width="{W}" height="{H}" href="{href}"/><path d="{path}" fill="none" stroke="black" stroke-width="1"/></svg>')
+            b = io.BytesIO(); crop.save(b, "PNG")
+            href = "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()
+            (out / "svg_full_print" / f"{name}.svg").write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><image width="{W}" height="{H}" href="{href}"/><path d="{path}" fill="none" stroke="black" stroke-width="1"/></svg>')
         else:
-            (out/"svg_full_print"/f"{name}.svg").write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><path d="{path}" fill="#eeeeee" stroke="black" stroke-width="1"/></svg>')
-        pieces.append({"id":name,"file":f"{name}.png","width_mm":w,"height_mm":h,"name":p["name"],"variant":p.get("variant",""),"cut":p["cut"],"notes":p["notes"],"geometry_points":p["points"],"grainline":p.get("grainline")})
+            (out / "svg_full_print" / f"{name}.svg").write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><path d="{path}" fill="#eeeeee" stroke="black" stroke-width="1"/></svg>')
+        pieces.append({"id": name, "file": f"{name}.png", "width_mm": w, "height_mm": h,
+                       "name": p["name"], "variant": p.get("variant", ""), "cut": p["cut"],
+                       "notes": p["notes"], "geometry_points": p["points"], "grainline": p.get("grainline")})
     return pieces
 
 def export_all(sheet, out: Path, original_png: bytes, plan=None, original_name="ORIGINAL PICTURE.png", swatch_bytes=None):
@@ -381,8 +439,10 @@ def export_all(sheet, out: Path, original_png: bytes, plan=None, original_name="
     out.mkdir(parents=True,exist_ok=True); (out/"ORIGINAL PICTURE.png").write_bytes(original_png)
     rendered,S=_render_geometry(plan,swatch_bytes)
     rgba=np.array(rendered); _png(rgba).startswith(b"\x89PNG")
-    rendered.save(out/"00_full_transparent.png","PNG")
-    rendered.convert("RGB").save(out/"Fabric Now 1.png")
+    rendered.save(out/"00_full_transparent.png", "PNG")
+    white_sheet = Image.new("RGBA", rendered.size, (255, 255, 255, 255))
+    white_sheet.alpha_composite(rendered)
+    white_sheet.convert("RGB").save(out/"Fabric Now 1.png", "PNG", optimize=True)
     pieces=_write_piece_assets(out,plan,swatch_bytes)
     manifest={
       "format":"fabricnow-basic-pattern-v3-mathematical-geometry",
